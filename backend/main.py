@@ -1,19 +1,13 @@
 from fastapi import FastAPI, UploadFile, File
-from fastapi.responses import JSONResponse, FileResponse
+from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
-import pandas as pd
-from io import StringIO
-import numpy as np
-import os
-import difflib  # ✅ Fuzzy matching
+import os, fitz, pickle, numpy as np, atexit
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from sentence_transformers import SentenceTransformer
 import google.generativeai as genai
 
-# === Gemini Setup ===
-genai.configure(api_key="AIzaSyBPbmhB_3Nxnkgn9RrfqfPtgluoqRmKWUM")
-
+# === App and CORS ===
 app = FastAPI()
-
-# === CORS ===
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -21,199 +15,192 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# === Fuzzy Column Matching ===
-def fuzzy_match(colnames, targets):
-    matches = []
-    for target in targets:
-        match = difflib.get_close_matches(target, colnames, n=1, cutoff=0.7)
-        if match:
-            matches.append(match[0])
-    return matches
+# === Config ===
+DOCUMENTS_FOLDER = "documents"
+CHUNK_CACHE_FILE = "chunked_embeddings.pkl"
+ALT_CACHE_FILE = "document_embeddings.pkl"
+CHUNK_SIZE = 5
+TOP_K = 3
+MODEL_NAME = "all-MiniLM-L6-v2"
+GEMINI_ENABLED = True
+GEMINI_API_KEY = "AIzaSyBPbmhB_3Nxnkgn9RrfqfPtgluoqRmKWUM"
+THREAD_WORKERS = 4  # Adjust based on your CPU
 
-# === Join Type Picker ===
-def pick_join_type(scenario: str) -> str:
-    if scenario in ["bank_recon", "generic_recon"]:
-        return "outer"
-    if scenario in ["loan_payment", "sales_inventory"]:
-        return "inner"
-    if scenario == "hr_payroll":
-        return "left"
-    return "outer"
+model = SentenceTransformer(MODEL_NAME)
+genai.configure(api_key=GEMINI_API_KEY)
 
-# === Guess Join Keys ===
-def guess_join_keys(df1, df2):
-    key_patterns = ['id', 'ref', 'code', 'number', 'transaction', 'loan', 'account', 'employee', 'customer', 'invoice', 'order']
-    df1_keys = [col for col in df1.columns if any(pat in col.lower() for pat in key_patterns)]
-    df2_keys = [col for col in df2.columns if any(pat in col.lower() for pat in key_patterns)]
-    common_keys = list(set(df1_keys) & set(df2_keys))
-    if common_keys:
-        return common_keys[0], common_keys[0]
-    if df1_keys and df2_keys:
-        return df1_keys[0], df2_keys[0]
-    return df1.columns[0], df2.columns[0]
+# === Logging ===
+def log(msg):
+    print(f"[LOG] {msg}")
 
-# === Gemini-Powered Scenario Detection ===
-def detect_scenario(df1, df2):
-    sample1 = df1.head(3).to_csv(index=False)
-    sample2 = df2.head(3).to_csv(index=False)
+# === Extract Chunks ===
+def extract_chunks(path, chunk_size=CHUNK_SIZE):
+    try:
+        doc = fitz.open(path)
+        chunks = []
+        for i in range(0, len(doc), chunk_size):
+            chunk_text = " ".join([doc[j].get_text() for j in range(i, min(i + chunk_size, len(doc)))])
+            if chunk_text.strip():
+                chunks.append((i, chunk_text))
+        log(f"✅ Extracted {len(chunks)} chunks from {path}")
+        return chunks
+    except Exception as e:
+        log(f"❌ Failed to extract chunks: {e}")
+        return []
 
+# === Cosine Similarity ===
+def cosine_sim(a, b):
+    return float(np.dot(a, b) / (np.linalg.norm(a) * np.linalg.norm(b)))
+
+# === Process One PDF ===
+def process_pdf_file(path):
+    try:
+        filename = os.path.basename(path)
+        log(f"🔍 Processing: {filename}")
+        chunks = extract_chunks(path)
+        vectors = []
+        for start_page, text in chunks:
+            try:
+                emb = model.encode(text)
+                vectors.append({"start_page": start_page, "embedding": emb})
+            except Exception as e:
+                log(f"❌ Encoding error in {filename} page {start_page}: {e}")
+        return filename, vectors
+    except Exception as e:
+        log(f"❌ Failed processing {path}: {e}")
+        return None, []
+
+# === Refresh Embeddings (Multithreaded) ===
+def refresh_embeddings():
+    log("🔁 Refreshing embeddings using ThreadPoolExecutor...")
+    chunked_embeddings = {}
+    pdf_paths = [
+        os.path.join(DOCUMENTS_FOLDER, file)
+        for file in os.listdir(DOCUMENTS_FOLDER)
+        if file.endswith(".pdf")
+    ]
+
+    with ThreadPoolExecutor(max_workers=THREAD_WORKERS) as executor:
+        futures = [executor.submit(process_pdf_file, path) for path in pdf_paths]
+        for future in as_completed(futures):
+            filename, vectors = future.result()
+            if filename and vectors:
+                chunked_embeddings[filename] = vectors
+                log(f"✅ Finished {filename} with {len(vectors)} embeddings.")
+
+    with open(CHUNK_CACHE_FILE, "wb") as f:
+        pickle.dump(chunked_embeddings, f)
+        log(f"💾 Saved embeddings to {CHUNK_CACHE_FILE}")
+    return chunked_embeddings
+
+# === Load or Create Cache ===
+def load_or_create_chunk_embeddings():
+    if os.path.exists(CHUNK_CACHE_FILE):
+        try:
+            with open(CHUNK_CACHE_FILE, "rb") as f:
+                log("📂 Loaded embeddings from cache.")
+                return pickle.load(f)
+        except Exception as e:
+            log(f"❌ Failed to load cache: {e}")
+    return refresh_embeddings()
+
+# === Startup Embedding Load ===
+stored_chunks = load_or_create_chunk_embeddings()
+
+# === Gemini Classification ===
+def classify_with_gemini(text):
     prompt = f"""
-You're a data scientist helping categorize two CSV tables.
+This is a document. Identify what kind of document it is (e.g., invoice, contract, payslip, bank statement, etc.)
+You can only reply with 1–3 words.
 
-You will receive two tables. Based on their content, choose **one** of the following types:
-- loan_payment
-- bank_recon
-- sales_inventory
-- hr_payroll
-- generic_recon
-
-### Table 1:
-{sample1}
-
-### Table 2:
-{sample2}
-
-Reply with only the label.
+Document:
+{text[:1500]}
 """
-
     try:
         model = genai.GenerativeModel("gemini-1.5-flash")
         response = model.generate_content(prompt)
-        result = response.text.strip().lower()
-        valid_labels = {"loan_payment", "bank_recon", "sales_inventory", "hr_payroll", "generic_recon"}
-        if result in valid_labels:
-            return result
-    except:
-        pass
+        log("✨ Gemini classification complete.")
+        return response.text.strip()
+    except Exception as e:
+        log(f"❌ Gemini failed: {e}")
+        return "Unknown"
 
-    return fallback_detect_scenario(df1, df2)
+# === Match Document ===
+@app.post("/match-document/")
+async def match_document(file: UploadFile = File(...)):
+    if file.content_type != "application/pdf":
+        return JSONResponse(status_code=400, content={"error": "Only PDF files are supported."})
 
-# === Fallback Scenario Detector (non-Gemini) ===
-def fallback_detect_scenario(df1, df2):
-    all_cols = [col.lower() for col in list(df1.columns) + list(df2.columns)]
-    if fuzzy_match(all_cols, ["loanamount", "amountrequested", "loan_amt"]) and fuzzy_match(all_cols, ["amountpaid", "amt_paid", "paid"]):
-        return "loan_payment"
-    if fuzzy_match(all_cols, ["unitssold", "qtysold"]) and fuzzy_match(all_cols, ["stockremaining", "inventory"]):
-        return "sales_inventory"
-    if fuzzy_match(all_cols, ["employeeid", "empid"]) and fuzzy_match(all_cols, ["salary", "payroll"]):
-        return "hr_payroll"
-    if fuzzy_match(all_cols, ["amount", "value", "balance"]):
-        return "bank_recon"
-    return "generic_recon"
-
-# === Smart Numeric Column Finder ===
-def find_best_numeric_col(df, preferred_keywords=None):
-    if preferred_keywords is None:
-        preferred_keywords = ['amount', 'value', 'loan', 'paid', 'total', 'balance', 'qty', 'stock', 'salary']
-    scored_cols = []
-    for col in df.columns:
-        col_l = col.lower()
-        score = sum(1 for kw in preferred_keywords if kw in col_l)
-        if pd.api.types.is_numeric_dtype(df[col]) and score > 0 and df[col].nunique() > 1:
-            scored_cols.append((col, score))
-    if scored_cols:
-        return sorted(scored_cols, key=lambda x: -x[1])[0][0]
-    for col in df.columns:
-        if pd.api.types.is_numeric_dtype(df[col]) and df[col].nunique() > 1:
-            return col
-    return None
-
-# === Merge with Status Prep ===
-def merge_data(df1, df2, key1, key2, scenario):
-    how = pick_join_type(scenario)
-    merged_df = pd.merge(df1, df2, left_on=key1, right_on=key2, how=how, suffixes=('_left', '_right'))
-
-    col1 = find_best_numeric_col(df1)
-    col2 = find_best_numeric_col(df2)
-
-    col1_merged = f"{col1}_left" if f"{col1}_left" in merged_df.columns else col1
-    col2_merged = f"{col2}_right" if f"{col2}_right" in merged_df.columns else col2
-
-    merged_df[col1_merged] = pd.to_numeric(merged_df[col1_merged], errors="coerce")
-    merged_df[col2_merged] = pd.to_numeric(merged_df[col2_merged], errors="coerce")
-
-    return merged_df, col1_merged, col2_merged, how
-
-# === Scenario-Based Status Logic ===
-def apply_status_logic(df: pd.DataFrame, scenario: str, col1: str, col2: str):
-    def safe(row, col):
-        return row[col] if col in row else np.nan
-
-    def get_status(row):
-        val1 = safe(row, col1)
-        val2 = safe(row, col2)
-
-        if pd.isna(val1) and pd.notna(val2):
-            return "Missing in df1"
-        if pd.notna(val1) and pd.isna(val2):
-            return "Missing in df2"
-        if pd.isna(val1) and pd.isna(val2):
-            return "No Data"
-
-        if scenario == "loan_payment":
-            if val2 == 0 or pd.isna(val2):
-                return "No Payment"
-            if np.isclose(val1, val2):
-                return "Fully Paid"
-            elif val2 < val1:
-                return "Partially Paid"
-            else:
-                return "Overpaid"
-
-        elif scenario == "sales_inventory":
-            if val2 <= 0 or pd.isna(val2):
-                return "Out of Stock"
-            elif val2 < val1:
-                return "Low Stock"
-            else:
-                return "In Stock"
-
-        elif scenario == "hr_payroll":
-            return "Paid" if not pd.isna(val2) else "Missing from Payroll"
-
-        if np.isclose(val1, val2, atol=1e-6):
-            return "Matched"
-        return "Mismatch"
-
-    df["Status"] = df.apply(get_status, axis=1)
-    return df
-
-# === Upload Endpoint ===
-@app.post("/merge-and-status/")
-async def merge_and_status(file1: UploadFile = File(...), file2: UploadFile = File(...)):
     try:
-        if file1.content_type != "text/csv" or file2.content_type != "text/csv":
-            return JSONResponse(status_code=400, content={"error": "Only CSV files are supported"})
+        contents = await file.read()
+        with open("temp_uploaded.pdf", "wb") as f:
+            f.write(contents)
 
-        df1 = pd.read_csv(StringIO((await file1.read()).decode()))
-        df2 = pd.read_csv(StringIO((await file2.read()).decode()))
+        log(f"📥 Uploaded file received: {file.filename}")
+        chunks = extract_chunks("temp_uploaded.pdf")
+        os.remove("temp_uploaded.pdf")
 
-        if df1.columns.str.match(r'^\d+$').all() or df2.columns.str.match(r'^\d+$').all():
-            return JSONResponse(status_code=400, content={"error": "Missing or invalid CSV headers."})
+        if not chunks:
+            return JSONResponse(status_code=400, content={"error": "No readable text found in PDF."})
 
-        key1, key2 = guess_join_keys(df1, df2)
-        scenario = detect_scenario(df1, df2)
+        results = []
+        for _, query_text in chunks:
+            query_emb = model.encode(query_text)
+            for filename, file_chunks in stored_chunks.items():
+                for item in file_chunks:
+                    score = cosine_sim(query_emb, item["embedding"])
+                    results.append({
+                        "file": filename,
+                        "score": score,
+                        "start_page": item["start_page"]
+                    })
 
-        merged_df, col1, col2, join_type = merge_data(df1, df2, key1, key2, scenario)
-        final_df = apply_status_logic(merged_df, scenario, col1, col2)
+        if not results:
+            return {"message": "No match found."}
 
-        safe_df = final_df.replace({np.nan: None})
+        top = sorted(results, key=lambda x: -x["score"])[:TOP_K]
+        best_score = top[0]['score']
 
-        return {
-            "message": f"Merged using scenario: {scenario}",
-            "join_keys": {"df1": key1, "df2": key2},
-            "value_columns": {"df1": col1, "df2": col2},
-            "join_type": join_type,
-            "columns": list(safe_df.columns),
-            "sample": safe_df.head(5).to_dict(orient="records")
+        response = {
+            "top_matches": [
+                {
+                    "file": r["file"],
+                    "similarity": round(r["score"], 3),
+                    "matched_start_page": r["start_page"]
+                } for r in top
+            ]
         }
 
-    except Exception as e:
-        return JSONResponse(status_code=500, content={"error": f"Processing error: {str(e)}"})
+        if GEMINI_ENABLED and best_score < 0.65:
+            sample_text = chunks[0][1]
+            response["gemini_guess"] = classify_with_gemini(sample_text)
 
-# === Download Endpoint ===
-@app.get("/download-merged/")
-def download_merged(path: str):
-    if os.path.exists(path):
-        return FileResponse(path, media_type="text/csv", filename="merged_result.csv")
-    return JSONResponse(status_code=404, content={"error": "File not found"})
+        return response
+
+    except Exception as e:
+        log(f"❌ Error in /match-document: {e}")
+        return JSONResponse(status_code=500, content={"error": f"Internal error: {str(e)}"})
+
+# === Refresh Cache ===
+@app.get("/refresh-cache/")
+def refresh_cache():
+    global stored_chunks
+    stored_chunks = refresh_embeddings()
+    return {"message": "Document cache refreshed."}
+
+# === Clean Up on Exit ===
+def cleanup_files():
+    for f in [CHUNK_CACHE_FILE, ALT_CACHE_FILE]:
+        try:
+            if os.path.exists(f):
+                os.remove(f)
+                log(f"🧹 Deleted file on exit: {f}")
+        except Exception as e:
+            log(f"❌ Failed to delete {f}: {e}")
+
+atexit.register(cleanup_files)
+
+# === Ping ===
+@app.get("/")
+def ping():
+    return {"status": "ok"}
