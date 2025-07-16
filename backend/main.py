@@ -62,7 +62,11 @@ def process_pdf_file(path):
         for start_page, text in chunks:
             try:
                 emb = model.encode(text)
-                vectors.append({"start_page": start_page, "embedding": emb})
+                vectors.append({
+                    "start_page": start_page,
+                    "embedding": emb,
+                    "text": text
+                })
             except Exception as e:
                 log(f"❌ Encoding error in {filename} page {start_page}: {e}")
         return filename, vectors
@@ -90,7 +94,7 @@ def refresh_embeddings():
 
     with open(CHUNK_CACHE_FILE, "wb") as f:
         pickle.dump(chunked_embeddings, f)
-        log(f"💾 Saved embeddings to {CHUNK_CACHE_FILE}")
+        log(f"🗒 Saved embeddings to {CHUNK_CACHE_FILE}")
     return chunked_embeddings
 
 # === Load or Create Cache ===
@@ -136,7 +140,7 @@ async def match_document(file: UploadFile = File(...)):
         with open("temp_uploaded.pdf", "wb") as f:
             f.write(contents)
 
-        log(f"📥 Uploaded file received: {file.filename}")
+        log(f"📅 Uploaded file received: {file.filename}")
         chunks = extract_chunks("temp_uploaded.pdf")
         os.remove("temp_uploaded.pdf")
 
@@ -152,7 +156,8 @@ async def match_document(file: UploadFile = File(...)):
                     results.append({
                         "file": filename,
                         "score": score,
-                        "start_page": item["start_page"]
+                        "start_page": item["start_page"],
+                        "text": item["text"]
                     })
 
         if not results:
@@ -161,21 +166,50 @@ async def match_document(file: UploadFile = File(...)):
         top = sorted(results, key=lambda x: -x["score"])[:TOP_K]
         best_score = top[0]['score']
 
-        response = {
-            "top_matches": [
-                {
-                    "file": r["file"],
-                    "similarity": round(r["score"], 3),
-                    "matched_start_page": r["start_page"]
-                } for r in top
-            ]
-        }
+        enriched_results = []
+        for match in top:
+            difference = ""
+            recommendation = ""
+            if GEMINI_ENABLED:
+                prompt = f"""
+Compare the following two policy texts and respond in two sections:
 
-        if GEMINI_ENABLED and best_score < 0.65:
-            sample_text = chunks[0][1]
-            response["gemini_guess"] = classify_with_gemini(sample_text)
+1. **Key Differences:** What are the most important differences in structure, content, intent, or language?
+2. **Remedy Recommendation:** What would the document on the left (Uploaded Submission) need to change to better align with the one on the right (Policy)?
 
-        return response
+Keep the response short and to the point. 2-3 bullet points at most.
+
+== Document 1 (Uploaded Submission) ==
+{chunks[0][1][:1500]}
+
+== Document 2 (Policy Document: {match['file']}) ==
+{match['text'][:1500]}
+"""
+                try:
+                    g_model = genai.GenerativeModel("gemini-1.5-flash")
+                    g_response = g_model.generate_content(prompt)
+                    diff_text = g_response.text.strip()
+
+                    if "**1. Key Differences:**" in diff_text and "**2. Remedy Recommendation:**" in diff_text:
+                        parts = diff_text.split("**2. Remedy Recommendation:**")
+                        difference = parts[0].replace("**1. Key Differences:**", "").strip()
+                        recommendation = parts[1].strip()
+                    else:
+                        recommendation = diff_text
+                        difference = ""
+                except Exception as e:
+                    log(f"❌ Gemini comparison failed for {match['file']}: {e}")
+                    difference = "Could not determine differences."
+                    recommendation = "No recommendation generated."
+
+            enriched_results.append({
+                "similarity_level": round(match["score"], 3),
+                "policy": match["file"],
+                "difference": difference,
+                "remedy_recommendation": recommendation
+            })
+
+        return {"matches": enriched_results}
 
     except Exception as e:
         log(f"❌ Error in /match-document: {e}")
@@ -194,7 +228,7 @@ def cleanup_files():
         try:
             if os.path.exists(f):
                 os.remove(f)
-                log(f"🧹 Deleted file on exit: {f}")
+                log(f"🪟 Deleted file on exit: {f}")
         except Exception as e:
             log(f"❌ Failed to delete {f}: {e}")
 
