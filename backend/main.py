@@ -19,12 +19,12 @@ app.add_middleware(
 DOCUMENTS_FOLDER = "documents"
 CHUNK_CACHE_FILE = "chunked_embeddings.pkl"
 ALT_CACHE_FILE = "document_embeddings.pkl"
-CHUNK_SIZE = 5
+CHUNK_SIZE = 2
 TOP_K = 3
 MODEL_NAME = "all-MiniLM-L6-v2"
 GEMINI_ENABLED = True
 GEMINI_API_KEY = "AIzaSyBPbmhB_3Nxnkgn9RrfqfPtgluoqRmKWUM"
-THREAD_WORKERS = 4  # Adjust based on your CPU
+THREAD_WORKERS = 4
 
 model = SentenceTransformer(MODEL_NAME)
 genai.configure(api_key=GEMINI_API_KEY)
