@@ -1,29 +1,48 @@
 #Reconclation logic
 
+# import pandas as pd
+# loans = pd.read_csv("C:/Users/shree/Desktop/loan_master_full.csv")
+# payments = pd.read_csv("C:/Users/shree/Desktop/loan_payment_full.csv")
+
+# paid_summary = payments.groupby('LoanID')['AmountPaid'].sum().reset_index()
+
+# # Merge loan info with payments
+# merged = pd.merge(loans, paid_summary, on="LoanID", how="outer")
+
+# # Fill NaN where payments are missing
+# merged['AmountPaid'].fillna(0, inplace=True)
+
+# # Add result column
+# merged['Status'] = merged.apply(
+#     lambda row: 'Fully Paid' if row['AmountPaid'] == row['LoanAmount']
+#     else ('Partially Paid' if row['AmountPaid'] > 0 else 'No Payment'),
+#     axis=1
+# )
+
+# # Save or return results
+# data=(merged[['LoanID', 'CustomerName', 'LoanAmount', 'AmountPaid', 'Status']])
+# print(data)
+
+
 import pandas as pd
-loans = pd.read_csv("C:/Users/shree/Desktop/loan_master_full.csv")
-payments = pd.read_csv("C:/Users/shree/Desktop/loan_payment_full.csv")
+from fastapi import UploadFile
 
-paid_summary = payments.groupby('LoanID')['AmountPaid'].sum().reset_index()
+async def reconcile_files(file1: UploadFile, file2: UploadFile):
+    loans = pd.read_csv(file1.file)
+    payments = pd.read_csv(file2.file)
 
-# Merge loan info with payments
-merged = pd.merge(loans, paid_summary, on="LoanID", how="outer")
+    paid_summary = payments.groupby('LoanID')['AmountPaid'].sum().reset_index()
+    merged = pd.merge(loans, paid_summary, on="LoanID", how="outer")
+    merged['AmountPaid'].fillna(0, inplace=True)
 
-# Fill NaN where payments are missing
-merged['AmountPaid'].fillna(0, inplace=True)
+    merged['Status'] = merged.apply(
+        lambda row: 'Fully Paid' if row['AmountPaid'] == row['LoanAmount']
+        else ('Partially Paid' if row['AmountPaid'] > 0 else 'No Payment'),
+        axis=1
+    )
 
-# Add result column
-merged['Status'] = merged.apply(
-    lambda row: 'Fully Paid' if row['AmountPaid'] == row['LoanAmount']
-    else ('Partially Paid' if row['AmountPaid'] > 0 else 'No Payment'),
-    axis=1
-)
-
-# Save or return results
-data=(merged[['LoanID', 'CustomerName', 'LoanAmount', 'AmountPaid', 'Status']])
-print(data)
-
-
+    result = merged[['LoanID', 'CustomerName', 'LoanAmount', 'AmountPaid', 'Status']]
+    return result.to_dict(orient='records')
 
 
 #........................................
