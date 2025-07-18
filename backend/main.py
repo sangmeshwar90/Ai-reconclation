@@ -1,5 +1,6 @@
 from fastapi import FastAPI, UploadFile, File
 from fastapi.responses import JSONResponse
+from route.auth import router as auth_route
 from fastapi.middleware.cors import CORSMiddleware
 import os, fitz, pickle, numpy as np, atexit
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -8,12 +9,17 @@ import google.generativeai as genai
 
 # === App and CORS ===
 app = FastAPI()
+
+
+
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+app.include_router(auth_route,prefix="/auth") 
 
 # === Config ===
 DOCUMENTS_FOLDER = "documents"
@@ -203,7 +209,7 @@ Keep the response short and to the point. 2-3 bullet points at most.
                     recommendation = "No recommendation generated."
 
             enriched_results.append({
-                "similarity_level": round(match["score"], 3),
+                "similarity_level": round(match["score"]*100, 2),
                 "policy": match["file"],
                 "difference": difference,
                 "remedy_recommendation": recommendation
